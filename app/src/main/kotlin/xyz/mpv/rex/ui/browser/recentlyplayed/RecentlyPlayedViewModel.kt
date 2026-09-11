@@ -66,9 +66,7 @@ class RecentlyPlayedViewModel(application: Application) :
         val playlistInfos = db.recentlyPlayedDao().getRecentlyPlayedPlaylists(limit = 20)
         
         val appearancePreferences by inject<xyz.mpv.rex.preferences.AppearancePreferences>()
-        val browserPreferences by inject<xyz.mpv.rex.preferences.BrowserPreferences>()
         val advancedPreferences by inject<xyz.mpv.rex.preferences.AdvancedPreferences>()
-        val watchedThreshold = browserPreferences.watchedThreshold.get()
         val autoRemoveDeleted = advancedPreferences.autoRemoveDeletedFromHistory.get()
 
         val deadPaths = mutableListOf<String>()
@@ -95,22 +93,16 @@ class RecentlyPlayedViewModel(application: Application) :
                   video = video.copy(savedOrientation = state.savedOrientation)
                 }
                 
-                if (state.hasBeenWatched) {
+                if (state.hasBeenWatched && state.timeRemaining == 0) {
                   isWatched = true
                 }
                 
-                if (video.duration > 0) {
+                if (video.duration > 0 && state.timeRemaining > 0) {
                   val durationSeconds = video.duration / 1000
                   val watched = durationSeconds - state.timeRemaining.toLong()
-                  val progressValue = if (durationSeconds > 0) {
-                    (watched.toFloat() / durationSeconds.toFloat()).coerceIn(0f, 1f)
-                  } else 0f
+                  val progressValue = (watched.toFloat() / durationSeconds.toFloat()).coerceIn(0f, 1f)
                   
-                  if (state.timeRemaining > 0 && progressValue >= (watchedThreshold / 100f)) {
-                    isWatched = true
-                  }
-                  
-                  if (progressValue in 0.01f..0.99f && !isWatched) {
+                  if (progressValue >= 0.01f) {
                     progress = progressValue
                   }
                 }

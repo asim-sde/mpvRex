@@ -78,8 +78,6 @@ class PlayerPlaybackStateController(
           oldState?.customAspectRatio ?: currentCustomRatio
         }
 
-        val watchedThreshold = activity.browserPreferences.watchedThreshold.get()
-        val progress = if (currentDuration > 0) currentPos.toFloat() / currentDuration.toFloat() else 0f
         val isFinished = isEof || ((currentDuration > 0) && (currentPos >= currentDuration - 1))
 
         // Calculate save position
@@ -95,7 +93,7 @@ class PlayerPlaybackStateController(
           oldState?.lastPosition ?: currentPos
         }
 
-        val timeRemaining = if (isFinished) 0 else if (currentDuration > savePos) currentDuration - savePos else 0
+        val timeRemaining = if (isFinished) 0 else if (currentDuration > savePos) currentDuration - savePos else (oldState?.timeRemaining ?: 0)
 
         activity.playbackStateRepository.upsert(
           PlaybackStateEntity(
@@ -115,7 +113,7 @@ class PlayerPlaybackStateController(
             externalAudioTracks = currentExternalAudio.joinToString("|"),
             videoAspect = currentAspectToSave,
             customAspectRatio = currentCustomRatioToSave,
-            hasBeenWatched = isFinished || progress >= (watchedThreshold / 100f),
+            hasBeenWatched = isFinished || (currentDuration <= 0 && oldState?.hasBeenWatched == true),
           ),
         )
       }.onFailure { e ->

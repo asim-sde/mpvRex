@@ -226,23 +226,19 @@ class SearchViewModel(
     val currentTime = System.currentTimeMillis()
     val thresholdDays = appearancePreferences.unplayedOldVideoDays.get()
     val thresholdMillis = thresholdDays * 24 * 60 * 60 * 1000L
-    val watchedThreshold = browserPreferences.watchedThreshold.get()
 
     items.filterIsInstance<FileSystemItem.VideoFile>().forEach { item ->
       val video = item.video
       val state = playbackStates.find { it.mediaTitle == video.path || it.mediaTitle == video.displayName }
       if (state != null) {
-        if (state.hasBeenWatched) {
+        if (state.hasBeenWatched && state.timeRemaining == 0) {
           watchedIds.add(video.id)
         }
-        if (video.duration > 0 && state.timeRemaining != -1) {
+        if (video.duration > 0 && state.timeRemaining > 0) {
           val durationSeconds = video.duration / 1000
           val watched = durationSeconds - state.timeRemaining.toLong()
           val progressValue = (watched.toFloat() / durationSeconds.toFloat()).coerceIn(0f, 1f)
-          if (progressValue >= (watchedThreshold / 100f)) {
-            watchedIds.add(video.id)
-          }
-          if (progressValue in 0.01f..0.99f) {
+          if (progressValue >= 0.01f) {
             playbackMap[video.id] = progressValue
           }
         }

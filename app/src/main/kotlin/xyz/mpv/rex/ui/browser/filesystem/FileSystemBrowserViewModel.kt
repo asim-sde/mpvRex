@@ -304,7 +304,6 @@ class FileSystemBrowserViewModel(
               val basicCurrentTime = System.currentTimeMillis()
               val basicThresholdDays = appearancePreferences.unplayedOldVideoDays.get()
               val basicThresholdMillis = basicThresholdDays * 24 * 60 * 60 * 1000L
-              val basicWatchedThreshold = browserPreferences.watchedThreshold.get()
 
               val preEnrichedItems = run {
                 val videoFiles = filteredItems.filterIsInstance<FileSystemItem.VideoFile>()
@@ -334,19 +333,14 @@ class FileSystemBrowserViewModel(
                     if (state.savedOrientation != null) {
                       updatedVideo = updatedVideo.copy(savedOrientation = state.savedOrientation)
                     }
-                    if (state.hasBeenWatched) {
+                    if (state.hasBeenWatched && state.timeRemaining == 0) {
                       basicWatchedIds.add(video.id)
                     }
-                    if (video.duration > 0 && state.timeRemaining != -1) {
+                    if (video.duration > 0 && state.timeRemaining > 0) {
                       val durationSeconds = video.duration / 1000
                       val watched = durationSeconds - state.timeRemaining.toLong()
                       val progressValue = (watched.toFloat() / durationSeconds.toFloat()).coerceIn(0f, 1f)
-                      
-                      if (progressValue >= (basicWatchedThreshold / 100f)) {
-                        basicWatchedIds.add(video.id)
-                      }
-                      
-                      if (progressValue in 0.01f..0.99f) {
+                      if (progressValue >= 0.01f) {
                         basicPlaybackMap[video.id] = progressValue
                       }
                     }
@@ -401,7 +395,6 @@ class FileSystemBrowserViewModel(
                   val finalCurrentTime = System.currentTimeMillis()
                   val finalThresholdDays = appearancePreferences.unplayedOldVideoDays.get()
                   val finalThresholdMillis = finalThresholdDays * 24 * 60 * 60 * 1000L
-                  val finalWatchedThreshold = browserPreferences.watchedThreshold.get()
 
                   val finalEnrichedItems = filteredItems.map { item ->
                     when (item) {
@@ -413,19 +406,14 @@ class FileSystemBrowserViewModel(
                           if (state.savedOrientation != null) {
                             video = video.copy(savedOrientation = state.savedOrientation)
                           }
-                          if (state.hasBeenWatched) {
+                          if (state.hasBeenWatched && state.timeRemaining == 0) {
                             finalWatchedIds.add(video.id)
                           }
-                          if (video.duration > 0 && state.timeRemaining != -1) {
+                          if (video.duration > 0 && state.timeRemaining > 0) {
                             val durationSeconds = video.duration / 1000
                             val watched = durationSeconds - state.timeRemaining.toLong()
                             val progressValue = (watched.toFloat() / durationSeconds.toFloat()).coerceIn(0f, 1f)
-                            
-                            if (progressValue >= (finalWatchedThreshold / 100f)) {
-                              finalWatchedIds.add(video.id)
-                            }
-                            
-                            if (progressValue in 0.01f..0.99f) {
+                            if (progressValue >= 0.01f) {
                               finalPlaybackMap[video.id] = progressValue
                             }
                           }

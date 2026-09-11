@@ -113,7 +113,6 @@ class MediaLibraryViewModel(
     val currentTime = System.currentTimeMillis()
     val thresholdDays = appearancePreferences.unplayedOldVideoDays.get()
     val thresholdMillis = thresholdDays * 24 * 60 * 60 * 1000L
-    val watchedThreshold = browserPreferences.watchedThreshold.get()
 
     val videosWithInfo =
       videos.map { video ->
@@ -127,11 +126,11 @@ class MediaLibraryViewModel(
         }
 
         // Calculate watch progress (0.0 to 1.0)
-        val progress = if (playbackState != null && video.duration > 0 && playbackState.timeRemaining != -1) {
+        val progress = if (playbackState != null && video.duration > 0 && playbackState.timeRemaining > 0) {
           val durationSeconds = video.duration / 1000
           val watched = durationSeconds - playbackState.timeRemaining.toLong()
           val progressValue = (watched.toFloat() / durationSeconds.toFloat()).coerceIn(0f, 1f)
-          if (progressValue in 0.01f..0.99f) progressValue else null
+          if (progressValue >= 0.01f) progressValue else null
         } else {
           null
         }
@@ -140,20 +139,7 @@ class MediaLibraryViewModel(
         val videoAge = currentTime - (video.dateModified * 1000)
         val isOldAndUnplayed = (playbackState == null && videoAge <= thresholdMillis) || (playbackState != null && playbackState.timeRemaining == -1)
 
-        val isWatched = if (playbackState != null) {
-          if (playbackState.hasBeenWatched) {
-            true
-          } else if (video.duration > 0 && playbackState.timeRemaining != -1) {
-            val durationSeconds = video.duration / 1000
-            val watched = durationSeconds - playbackState.timeRemaining.toLong()
-            val progressValue = (watched.toFloat() / durationSeconds.toFloat()).coerceIn(0f, 1f)
-            progressValue >= (watchedThreshold / 100f)
-          } else {
-            false
-          }
-        } else {
-          false
-        }
+        val isWatched = playbackState != null && playbackState.hasBeenWatched && playbackState.timeRemaining == 0
 
         VideoWithPlaybackInfo(
           video = videoWithOrientation,

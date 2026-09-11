@@ -766,6 +766,7 @@ private fun <T> ExplorerItemCard(
         isGridMode = isGridMode,
         gridColumns = columns,
         showSubtitleIndicator = showSubtitleIndicator,
+        progressPercentage = videoPlaybackProgress[item.id],
         isOldAndUnplayed = isOldAndUnplayed,
         isWatched = isWatched,
         isRecentlyPlayed = isRecentlyPlayed

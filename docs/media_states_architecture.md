@@ -32,8 +32,8 @@ Here is how each individual media state is defined, evaluated, and visualised:
 | State | Definition & Rationale | Evaluation Logic | UI Representation |
 | :--- | :--- | :--- | :--- |
 | **New** | Video added recently and never played, or manually marked as new to remind the user to watch. | `state.timeRemaining == -1` <br>OR<br> (No playback state AND `videoAge <= unplayedOldVideoDays` threshold) | Renders a red **`NEW`** badge overlay on the card. |
-| **Never Played** | Video has no playback progress. Rationale: to decide whether to hide/show the progress bar. | `videoFilesWithPlayback[videoId] == null` (i.e. progress is not in the `0.01..0.99` range). | No progress bar is shown on the card. |
-| **Watched** | Video has been completed. Rationale: to help the user identify already watched files by dimming them. | `state.hasBeenWatched == true` <br>OR<br> progress percentage $\ge$ `watchedThreshold` (e.g. 90%). | Title text is dimmed (`onSurface` at 60% opacity). |
+| **Never Played** | Video has no playback progress. Rationale: to decide whether to hide/show the progress bar. | `videoFilesWithPlayback[videoId] == null` (i.e. no progress or completed). | No progress bar is shown on the card. |
+| **Watched** | Video has reached true completion (0:00 remaining). Rationale: to help the user identify completed files by dimming them. | `state.hasBeenWatched == true && state.timeRemaining == 0` (completed / 0:00 remaining). | Title text is dimmed (`onSurface` at 60% opacity). |
 | **Last Played** | The single video or batch of videos marked/played most recently (globally or within the current folder). Rationale: target for auto-scroll and main focus. | `video.path in lastPlayedVideoPathsInFolder` | Title text is highlighted in **Primary Color** and styled as **Black/Bold**. |
 | **Recently Played** | (Deprecated for UI highlighting) Previously highlighted folders containing history files. Now folders only highlight if they contain the active Last Played file. | None | Neither folders nor videos use this state for highlighting anymore to prevent clutter. |
 
