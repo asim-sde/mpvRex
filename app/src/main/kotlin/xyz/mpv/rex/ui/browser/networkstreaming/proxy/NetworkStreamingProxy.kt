@@ -9,12 +9,6 @@ import xyz.mpv.rex.ui.browser.networkstreaming.clients.SmbClient
 import com.hierynomus.msdtyp.AccessMask
 import com.hierynomus.mssmb2.SMB2CreateDisposition
 import com.hierynomus.mssmb2.SMB2ShareAccess
-import com.hierynomus.smbj.SMBClient
-import com.hierynomus.smbj.SmbConfig
-import com.hierynomus.smbj.auth.AuthenticationContext
-import com.hierynomus.smbj.connection.Connection
-import com.hierynomus.smbj.session.Session
-import com.hierynomus.smbj.share.DiskShare
 import fi.iki.elonen.NanoHTTPD
 import kotlinx.coroutines.runBlocking
 import java.io.BufferedInputStream
@@ -22,7 +16,6 @@ import java.io.InputStream
 import java.util.EnumSet
 import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
@@ -185,6 +178,41 @@ class NetworkStreamingProxy private constructor() : NanoHTTPD("127.0.0.1", 0) {
     }
 
     val fileSize = streamInfo.fileSize
+
+    // An unknown size must not fail the request: the player's HTTP client
+    // treats any 5xx as fatal with no retry. Only the SMB range stream needs
+    // a real length (PrefetchingSmbInputStream self-limits against it; SMB
+    // listings always supply one); every other data layer streams to EOF
+    // independent of the requested length.
+    if (fileSize < 0) {
+      if (streamInfo.client is SmbClient) {
+        return newFixedLengthResponse(
+          Response.Status.INTERNAL_ERROR,
+          MIME_PLAINTEXT,
+          "Failed to determine file size",
+        )
+      }
+
+      val unknownSizeStream = getStreamWithOffset(streamInfo, start, -1L)
+      if (unknownSizeStream == null) {
+        return newFixedLengthResponse(
+          Response.Status.INTERNAL_ERROR,
+          MIME_PLAINTEXT,
+          "Failed to open stream",
+        )
+      }
+
+      // The last byte position is unknown, so a valid 206 is impossible; the
+      // body still starts at the requested offset.
+      val response = newChunkedResponse(Response.Status.OK, streamInfo.mimeType, unknownSizeStream)
+      response.addHeader("Accept-Ranges", "bytes")
+      return response
+    }
+
+    if (fileSize == 0L) {
+      return newFixedLengthResponse(Response.Status.OK, streamInfo.mimeType, "")
+    }
+
     val rangeEnd = end ?: (fileSize - 1)
     val contentLength = rangeEnd - start + 1
 
@@ -223,6 +251,10 @@ class NetworkStreamingProxy private constructor() : NanoHTTPD("127.0.0.1", 0) {
       streamInfo.fileSize = getFileSize(streamInfo)
     }
 
+    if (streamInfo.fileSize == 0L) {
+      return newFixedLengthResponse(Response.Status.OK, streamInfo.mimeType, "")
+    }
+
     val inputStream = getStream(streamInfo)
 
     if (inputStream == null) {
@@ -231,6 +263,14 @@ class NetworkStreamingProxy private constructor() : NanoHTTPD("127.0.0.1", 0) {
         MIME_PLAINTEXT,
         "Failed to open stream",
       )
+    }
+
+    // The player's HTTP client treats any 5xx as a fatal open error with no
+    // retry, so an unknown size streams chunked to EOF instead of failing.
+    if (streamInfo.fileSize < 0) {
+      val response = newChunkedResponse(Response.Status.OK, streamInfo.mimeType, inputStream)
+      response.addHeader("Accept-Ranges", "bytes")
+      return response
     }
 
     val response = newFixedLengthResponse(
@@ -286,94 +326,46 @@ class NetworkStreamingProxy private constructor() : NanoHTTPD("127.0.0.1", 0) {
     }
   }
 
-  /**
-   * Get the file size using SMB.
-   * Opens a discrete connection, queries the file, and tears the socket down immediately.
-   */
-  private suspend fun getFileSizeSMB(streamInfo: StreamInfo): Long {
-    var smbClient: SMBClient? = null
-    var connection: Connection? = null
-    var session: Session? = null
-    var diskShare: DiskShare? = null
-    var file: com.hierynomus.smbj.share.File? = null
+  private fun decodeSmbPath(path: String): String =
+    runCatching { java.net.URLDecoder.decode(path, "UTF-8") }.getOrElse { path }
 
-    try {
-      Log.d(TAG, "SMB getFileSize called")
-      Log.d(TAG, "  Connection path: ${streamInfo.connection.path}")
+  private fun parseSmbRelativePath(filePath: String): String? {
+    return when {
+      filePath.startsWith("smb://", ignoreCase = true) -> {
+        val pathAfterProtocol = filePath.substring(6)
+        val firstSlash = pathAfterProtocol.indexOf('/')
+        if (firstSlash == -1) return null
+
+        val pathAfterHost = pathAfterProtocol.substring(firstSlash + 1)
+        val secondSlash = pathAfterHost.indexOf('/')
+        if (secondSlash == -1) "" else pathAfterHost.substring(secondSlash + 1)
+      }
+      else -> filePath.trim('/')
+    }
+  }
+
+  private suspend fun getFileSizeSMB(streamInfo: StreamInfo): Long {
+    val smbClient = streamInfo.client as? SmbClient ?: return -1L
+
+    return try {
+      Log.d(TAG, "SMB getFileSize called (shared session)")
       Log.d(TAG, "  File path: ${streamInfo.filePath}")
 
-      // Extract the base share name, explicitly rejecting nested paths
-      val shareName = streamInfo.connection.path.trim('/')
-
-      if (shareName.isEmpty() || shareName.contains('/')) {
-        Log.e(TAG, "SMB: Invalid share name: $shareName")
-        return -1L
-      }
-
-      // Isolate the relative file path within the share.
-      // Expected input format: smb://host/shareName/path/to/file.mkv
-      val relativePath = when {
-        streamInfo.filePath.startsWith("smb://", ignoreCase = true) -> {
-          // Bypassing standard URI parsing to avoid premature encoding shifts
-          val pathAfterProtocol = streamInfo.filePath.substring(6) 
-          val firstSlash = pathAfterProtocol.indexOf('/')
-          if (firstSlash == -1) {
-            Log.e(TAG, "Invalid SMB path format")
-            return -1L
-          }
-
-          val pathAfterHost = pathAfterProtocol.substring(firstSlash + 1)
-          val secondSlash = pathAfterHost.indexOf('/')
-          if (secondSlash == -1) "" else pathAfterHost.substring(secondSlash + 1)
+      smbClient.withSharedSession { _, shareName ->
+        val relativePath = parseSmbRelativePath(streamInfo.filePath)
+        if (relativePath == null) {
+          Log.e(TAG, "Invalid SMB path format: ${streamInfo.filePath}")
+          return@withSharedSession -1L
         }
-        else -> streamInfo.filePath.trim('/')
+
+        val decodedRelativePath = decodeSmbPath(relativePath)
+        Log.d(TAG, "  Final: share=$shareName, relativePath=$decodedRelativePath")
+
+        smbClient.connectShare().getFileInformation(decodedRelativePath).standardInformation.endOfFile
       }
-
-      // Decode URL-encoded characters (e.g., %20 to space) so SMBJ can resolve the literal disk path
-      val decodedRelativePath = java.net.URLDecoder.decode(relativePath, "UTF-8")
-      Log.d(TAG, "  Final: share=$shareName, relativePath=$decodedRelativePath")
-
-      val smbConfig = SmbConfig.builder()
-        .withTimeout(30000, TimeUnit.MILLISECONDS)
-        .withSoTimeout(35000, TimeUnit.MILLISECONDS)
-        .build()
-        
-      smbClient = SMBClient(smbConfig)
-
-      val authContext = if (streamInfo.connection.isAnonymous) {
-        AuthenticationContext.anonymous()
-      } else {
-        AuthenticationContext(
-          streamInfo.connection.username,
-          streamInfo.connection.password.toCharArray(),
-          null,
-        )
-      }
-
-      connection = smbClient.connect(streamInfo.connection.host, streamInfo.connection.port)
-      session = connection.authenticate(authContext)
-      diskShare = session.connectShare(shareName) as DiskShare
-      
-      file = diskShare.openFile(
-        decodedRelativePath,
-        EnumSet.of(AccessMask.GENERIC_READ),
-        null,
-        EnumSet.of(SMB2ShareAccess.FILE_SHARE_READ),
-        SMB2CreateDisposition.FILE_OPEN,
-        null,
-      )
-      
-      return file.fileInformation.standardInformation.endOfFile
-
     } catch (e: Exception) {
       Log.e(TAG, "SMB getFileSize error: ${e.message}", e)
-      return -1L
-    } finally {
-      runCatching { file?.close() }
-      runCatching { diskShare?.close() }
-      runCatching { session?.close() }
-      runCatching { connection?.close() }
-      runCatching { smbClient?.close() }
+      -1L
     }
   }
 
@@ -713,15 +705,6 @@ class NetworkStreamingProxy private constructor() : NanoHTTPD("127.0.0.1", 0) {
     }
   }
 
-  /**
-   * Generates a seekable InputStream for SMB files.
-   *
-   * Reuses the SmbClient's shared session so each new HTTP range request
-   * (i.e. every seek) no longer pays for a full connection setup (TCP +
-   * negotiate + NTLM auth + tree connect ≈ 6-8 RTTs, which dominated seek
-   * latency); only a fresh tree connection and file handle are opened per
-   * request, and the stream's close() tears those down.
-   */
   private suspend fun getStreamWithOffsetSMB(
     streamInfo: StreamInfo,
     offset: Long,
@@ -735,52 +718,34 @@ class NetworkStreamingProxy private constructor() : NanoHTTPD("127.0.0.1", 0) {
       Log.d(TAG, "  File path: ${streamInfo.filePath}")
 
       // Isolate the relative file path within the share
-      val relativePath = when {
-        streamInfo.filePath.startsWith("smb://", ignoreCase = true) -> {
-          val pathAfterProtocol = streamInfo.filePath.substring(6)
-          val firstSlash = pathAfterProtocol.indexOf('/')
-          if (firstSlash == -1) {
-            Log.e(TAG, "Invalid SMB path format")
-            return null
-          }
-
-          val pathAfterHost = pathAfterProtocol.substring(firstSlash + 1)
-          val secondSlash = pathAfterHost.indexOf('/')
-          if (secondSlash == -1) "" else pathAfterHost.substring(secondSlash + 1)
-        }
-        else -> streamInfo.filePath.trim('/')
+      val relativePath = parseSmbRelativePath(streamInfo.filePath)
+      if (relativePath == null) {
+        Log.e(TAG, "Invalid SMB path format: ${streamInfo.filePath}")
+        return null
       }
 
       // Decode URL-encoded characters so SMBJ can resolve the literal disk path
-      val decodedRelativePath = java.net.URLDecoder.decode(relativePath, "UTF-8")
+      val decodedRelativePath = decodeSmbPath(relativePath)
       Log.d(TAG, "  Final: relativePath=$decodedRelativePath")
 
-      // Reuse the shared session (with auto-reconnect) instead of building a
-      // whole new SMB connection per range request.
-      return smbClient.withSharedSession { session, shareName ->
-        val diskShare = session.connectShare(shareName) as DiskShare
-        try {
-          val file = diskShare.openFile(
-            decodedRelativePath,
-            EnumSet.of(AccessMask.GENERIC_READ),
-            null,
-            EnumSet.of(SMB2ShareAccess.FILE_SHARE_READ),
-            SMB2CreateDisposition.FILE_OPEN,
-            null,
-          )
+      return smbClient.withSharedSession { _, _ ->
+        val diskShare = smbClient.connectShare()
+        val file = diskShare.openFile(
+          decodedRelativePath,
+          EnumSet.of(AccessMask.GENERIC_READ),
+          null,
+          EnumSet.of(SMB2ShareAccess.FILE_SHARE_READ),
+          SMB2CreateDisposition.FILE_OPEN,
+          null,
+        )
 
-          Log.d(TAG, "  Stream created successfully starting at offset $offset, contentLength=$contentLength")
+        Log.d(TAG, "  Stream created successfully starting at offset $offset, contentLength=$contentLength")
 
-          PrefetchingSmbInputStream(
-            fileHandle = file,
-            diskShare = diskShare,
-            initialOffset = offset,
-            contentLength = contentLength,
-          )
-        } catch (e: Exception) {
-          runCatching { diskShare.close() }
-          throw e
-        }
+        PrefetchingSmbInputStream(
+          fileHandle = file,
+          initialOffset = offset,
+          contentLength = contentLength,
+        )
       }
     } catch (e: Exception) {
       Log.e(TAG, "SMB getStreamWithOffset error: ${e.message}", e)
@@ -817,50 +782,37 @@ class NetworkStreamingProxy private constructor() : NanoHTTPD("127.0.0.1", 0) {
   }
 
   /**
-   * Seekable SMB stream with an internal prefetching double-buffer.
+   * Serves an SMB file through a background prefetcher.
    *
-   * WHY: NanoHTTPD 2.3.1 streams response bodies by reading the wrapped
-   * InputStream in hard-coded 16 KiB chunks (Response.sendBody), and with a
-   * non-buffered SMB stream each chunk becomes one synchronous SMB2 READ
-   * round-trip. On Wi-Fi (3-5 ms RTT) that caps throughput at roughly
-   * 16 KiB / RTT ≈ 4-6 MB/s, no matter how much bandwidth is available.
+   * NanoHTTPD 2.3.1 copies response bodies out in hard-coded 16 KiB chunks;
+   * without prefetching, every SMB read would inherit that granularity. The
+   * prefetch thread instead pulls [BLOCK_SIZE] blocks into [queue],
+   * decoupling the consumer's read granularity from the SMB read granularity,
+   * and self-limits to [contentLength] so reads never go past the requested
+   * range.
    *
-   * This stream decouples the consumer's read granularity from the SMB read
-   * granularity: a dedicated daemon thread issues large (1 MiB) SMB2 reads
-   * ahead of the consumer and pushes them into a small block queue. The
-   * consumer (NanoHTTPD) keeps reading its 16 KiB chunks, but they are served
-   * from memory instead of the network, making throughput bandwidth-bound
-   * (1 MiB per RTT) instead of latency-bound.
-   *
-   * The prefetch thread self-limits to [contentLength] bytes so an abandoned
-   * connection (NanoHTTPD does not close the stream when the client drops
-   * mid-response) does not keep pulling the whole 20 GiB file.
-   *
-   * Only the file handle and this stream's own tree connection are closed by
-   * [close]; the underlying session/connection are shared via
-   * [SmbClient.withSharedSession] and owned by the client.
+   * [close] releases only the SMB file handle: the DiskShare is cached on
+   * the session and owned by SmbClient.
    */
   private class PrefetchingSmbInputStream(
     private val fileHandle: com.hierynomus.smbj.share.File,
-    private val diskShare: DiskShare,
     initialOffset: Long,
     private val contentLength: Long,
   ) : InputStream() {
 
     companion object {
       private const val TAG = "NetworkStreamingProxy"
-
-      /** Size of each SMB2 read issued by the prefetch thread. */
-      private const val BLOCK_SIZE = 1024 * 1024
-
-      /** Blocks buffered ahead of the consumer (double buffering). */
+      // Must stay <= SmbClient's read buffer size or each block silently
+      // degrades into multiple smaller SMB2 reads.
+      private const val BLOCK_SIZE = 4 * 1024 * 1024
+      private const val FIRST_BLOCK_SIZE = 1024 * 1024
       private const val PREFETCH_DEPTH = 2
 
-      /** Sentinel pushed by the prefetch thread to signal EOF / error. */
+      // Zero-length sentinel matched by reference (===); the filled <= 0
+      // guard in prefetchLoop keeps every other queue entry non-empty.
       private val EOF_MARKER = ByteArray(0)
     }
 
-    /** Block queue; [EOF_MARKER] signals EOF / error (null is not allowed). */
     private val queue = ArrayBlockingQueue<ByteArray>(PREFETCH_DEPTH)
 
     private var currentBlock: ByteArray? = null
@@ -868,10 +820,7 @@ class NetworkStreamingProxy private constructor() : NanoHTTPD("127.0.0.1", 0) {
     private var eof = false
     private val closed = AtomicBoolean(false)
 
-    /** Prefetch thread's read cursor; only touched by the prefetch thread. */
     private var readPosition = initialOffset
-
-    /** Total bytes read from the file; only touched by the prefetch thread. */
     private var bytesReadFromFile = 0L
 
     private val prefetchThread =
@@ -885,18 +834,25 @@ class NetworkStreamingProxy private constructor() : NanoHTTPD("127.0.0.1", 0) {
         while (!closed.get()) {
           val remaining = contentLength - bytesReadFromFile
           if (remaining <= 0) break
-          val requestLen = minOf(BLOCK_SIZE.toLong(), remaining).toInt()
+          val blockSize = if (bytesReadFromFile == 0L) FIRST_BLOCK_SIZE else BLOCK_SIZE
+          val requestLen = minOf(blockSize.toLong(), remaining).toInt()
           val block = ByteArray(requestLen)
-          val n = fileHandle.read(block, readPosition, 0, requestLen)
-          if (n <= 0) break // EOF or error
-          readPosition += n
-          bytesReadFromFile += n
-          // Full-block reads are handed over as-is; short reads (last block,
-          // or a server that returned less than requested) are trimmed.
-          queue.put(if (n == block.size) block else block.copyOf(n))
+          var filled = 0
+          var hitEof = false
+          while (filled < requestLen && !closed.get()) {
+            val n = fileHandle.read(block, readPosition, filled, requestLen - filled)
+            if (n <= 0) { hitEof = true; break }
+            readPosition += n
+            bytesReadFromFile += n
+            filled += n
+          }
+          // A zero-length block must never be enqueued: EOF_MARKER is the
+          // only zero-length array the queue may hold, and serving an empty
+          // block would make read() return an illegal 0.
+          if (filled <= 0) break
+          queue.put(if (filled == block.size) block else block.copyOf(filled))
+          if (hitEof) break
         }
-        // Signal EOF to the consumer. offer() is used so a consumer that
-        // already went away (close()) can never leave us blocked here.
         if (!closed.get()) {
           runCatching { queue.put(EOF_MARKER) }
         }
@@ -904,7 +860,9 @@ class NetworkStreamingProxy private constructor() : NanoHTTPD("127.0.0.1", 0) {
         Thread.currentThread().interrupt()
       } catch (e: Exception) {
         Log.e(TAG, "SMB prefetch error: ${e.message}", e)
-        runCatching { queue.offer(EOF_MARKER) }
+        if (!closed.get()) {
+          runCatching { queue.put(EOF_MARKER) }
+        }
       }
     }
 
@@ -952,7 +910,7 @@ class NetworkStreamingProxy private constructor() : NanoHTTPD("127.0.0.1", 0) {
     override fun available(): Int {
       if (closed.get() || eof) return 0
       val inCurrent = currentBlock?.let { it.size - blockPos } ?: 0
-      return inCurrent + queue.size * BLOCK_SIZE
+      return inCurrent + queue.sumOf { it.size }
     }
 
     override fun close() {
@@ -962,11 +920,7 @@ class NetworkStreamingProxy private constructor() : NanoHTTPD("127.0.0.1", 0) {
         // Wake a consumer blocked in queue.take().
         queue.drainTo(ArrayList())
         queue.offer(EOF_MARKER)
-        // Only the file handle and this stream's own tree connection are
-        // owned here; the shared session/connection belong to SmbClient and
-        // must not be closed from this stream.
         runCatching { fileHandle.close() }
-        runCatching { diskShare.close() }
       }
     }
   }

@@ -819,6 +819,42 @@ class PlayerActivity :
     )
   }
 
+  internal fun proxyDemuxerCacheOptions(playableUri: String): String? =
+    if (NetworkStreamTuning.isProxyUrl(playableUri)) {
+      NetworkStreamTuning.loadFileOptions(this)
+    } else {
+      null
+    }
+
+  /**
+   * Issues `loadfile` on a worker thread. The lifecycle check, the [options] computation,
+   * and [MPVLib.command] run under [MPVLifecycleLock.nativeApiLock] as one atomic section —
+   * [cleanupMPV] holds the same lock across `MPVLib.destroy()`, because a check alone is
+   * check-then-act and the JNI layer exits the process on a command that overlaps or
+   * outlives teardown.
+   *
+   * [options] produces loadfile's 5th argument when non-null; the default attaches proxy
+   * demuxer cache options for localhost proxy streams. Callers that must not attach any
+   * (the M3U/HLS fallback, where loadfile expands a playlist rather than opening a stream)
+   * pass `{ null }`.
+   */
+  internal fun dispatchLoadFile(
+    playableUri: String,
+    options: (playableUri: String) -> String? = { proxyDemuxerCacheOptions(playableUri) },
+  ) {
+    lifecycleScope.launch(Dispatchers.Default) {
+      synchronized (MPVLifecycleLock.nativeApiLock) {
+        if (!MPVLifecycleLock.isNativeInitialized || MPVLifecycleLock.isTearingDown.value) return@launch
+        val loadOptions = options(playableUri)
+        if (loadOptions != null) {
+          MPVLib.command("loadfile", playableUri, "replace", "-1", loadOptions)
+        } else {
+          MPVLib.command("loadfile", playableUri)
+        }
+      }
+    }
+  }
+
   internal fun playDirectMedia(playableUri: String) {
     isReady = false
     currentResolvedStream = null
@@ -827,12 +863,11 @@ class PlayerActivity :
     if (!playerPreferences.autoplayOnOpen.get() || playerPreferences.savePositionOnQuit.get() || playerPreferences.resumePlaybackMode.get() != ResumePlaybackMode.Never) {
       runCatching { MPVLib.setPropertyBoolean("pause", true) }
     }
+    val loadCommand: () -> Unit = { dispatchLoadFile(playableUri) }
     if (mpvInitialized && player.holder.surface.isValid) {
-      lifecycleScope.launch(Dispatchers.Default) {
-        MPVLib.command("loadfile", playableUri)
-      }
+      loadCommand()
     } else {
-      player.playFile(playableUri)
+      player.pendingColdStartLoad = loadCommand
     }
   }
 
@@ -963,12 +998,9 @@ class PlayerActivity :
         }.joinToString(",")
 
         if (hasMpvStarted) {
-          lifecycleScope.launch(Dispatchers.Default) {
-            Log.d(TAG, "Executing MPVLib.command loadfile for web stream with options: $loadOptions")
-            MPVLib.command("loadfile", streamToPlay, "replace", "-1", loadOptions)
-          }
+          dispatchLoadFile(streamToPlay) { loadOptions }
         } else {
-          player.playFile(streamToPlay)
+          player.pendingColdStartLoad = { dispatchLoadFile(streamToPlay) { loadOptions } }
         }
       } else {
         Log.w(TAG, "Failed to resolve stream via yt-dlp: ${resolved.errorMessage}. Attempting direct MPV playback as fallback.")
@@ -1226,28 +1258,32 @@ class PlayerActivity :
     }
 
     MPVLifecycleLock.onTeardownStart()
-    try {
-      runCatching {
-        MPVLib.removeObserver(playerObserver)
-
-        if (isReady) {
-          MPVLib.setPropertyBoolean("pause", true)
-          MPVLib.command("quit")
-        }
-
-        // Explicitly detach Surface and set VO to null so Android RenderThread drops ANativeWindow mutexes
+    // Held across the native teardown calls so a loadfile already past its lifecycle check
+    // (dispatchLoadFile) finishes before MPVLib.destroy() runs instead of racing it.
+    synchronized (MPVLifecycleLock.nativeApiLock) {
+      try {
         runCatching {
-          MPVLib.setPropertyString("vo", "null")
-          MPVLib.detachSurface()
-        }
+          MPVLib.removeObserver(playerObserver)
 
-        MPVLib.destroy()
-        mpvInitialized = false
-      }.onFailure { e ->
-        Log.e(TAG, "Error cleaning up MPV", e)
+          if (isReady) {
+            MPVLib.setPropertyBoolean("pause", true)
+            MPVLib.command("quit")
+          }
+
+          // Explicitly detach Surface and set VO to null so Android RenderThread drops ANativeWindow mutexes
+          runCatching {
+            MPVLib.setPropertyString("vo", "null")
+            MPVLib.detachSurface()
+          }
+
+          MPVLib.destroy()
+          mpvInitialized = false
+        }.onFailure { e ->
+          Log.e(TAG, "Error cleaning up MPV", e)
+        }
+      } finally {
+        MPVLifecycleLock.onTeardownComplete()
       }
-    } finally {
-      MPVLifecycleLock.onTeardownComplete()
     }
   }
 

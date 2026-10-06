@@ -23,11 +23,16 @@ class PlaybackManager(
         private const val TAG = "PlaybackManager"
         private const val SEEK_COALESCE_REMOTE_MS = 150L
         private const val SEEK_COALESCE_LOCAL_MS = 40L
+        private const val SCRUB_COALESCE_REMOTE_MS = 300L
     }
 
     private var seekJob: Job? = null
     private var resyncJob: Job? = null
     @Volatile private var lastSeekAt = 0L
+    @Volatile private var lastScrubDispatchedPosition = Int.MIN_VALUE
+    // Seeks abort unless their generation is still current: Job.cancel() cannot stop a
+    // coroutine already past its last isActive check, e.g. blocked inside ensureUnmuted().
+    @Volatile private var seekGeneration = 0
 
     private fun canAccessMpv(): Boolean =
         MPVLifecycleLock.isNativeInitialized && !MPVLifecycleLock.isTearingDown.value
@@ -37,9 +42,20 @@ class PlaybackManager(
         seekJob = null
         resyncJob?.cancel()
         resyncJob = null
+        lastScrubDispatchedPosition = Int.MIN_VALUE
+    }
+
+    fun cancelPendingSeek() {
+        seekJob?.cancel()
+        seekJob = null
+        lastScrubDispatchedPosition = Int.MIN_VALUE
+        seekGeneration++
     }
 
     fun onPlaybackRestart() {
+        // PLAYBACK_RESTART settles playback state, invalidating the scrub-dedup bookkeeping;
+        // without this reset a scrub back to the last dispatched position would be dropped.
+        lastScrubDispatchedPosition = Int.MIN_VALUE
         ensureUnmuted()
     }
 
@@ -60,15 +76,32 @@ class PlaybackManager(
      * Clamps the position between 0 and duration, and optionally within AB loop.
      * Handles streams with undetermined duration gracefully and cancels prior in-flight seeks.
      */
-    fun seekTo(scope: CoroutineScope, position: Int, abLoopA: Double?, abLoopB: Double?) {
-        seekJob?.cancel()
+    fun seekTo(
+        scope: CoroutineScope,
+        position: Int,
+        abLoopA: Double?,
+        abLoopB: Double?,
+        isScrub: Boolean = false,
+        flush: Boolean = false,
+    ) {
+        val previousJob = seekJob
+        previousJob?.cancel()
+        val generation = ++seekGeneration
         if (!canAccessMpv()) return
         seekJob = scope.launch(Dispatchers.IO) {
+            // An older job already past its final check still dispatches (cancellation cannot
+            // retract it); wait it out so this seek's command never lands before an older
+            // one's — mpv applies seeks in arrival order.
+            previousJob?.join()
             if (!isActive || !canAccessMpv()) return@launch
             val isRemote = runCatching { MPVLib.getPropertyString("path") }.getOrNull()?.startsWith("http", ignoreCase = true) == true
-            val coalesceMs = if (isRemote) SEEK_COALESCE_REMOTE_MS else SEEK_COALESCE_LOCAL_MS
+            val coalesceMs = when {
+                isScrub && isRemote -> SCRUB_COALESCE_REMOTE_MS
+                isRemote -> SEEK_COALESCE_REMOTE_MS
+                else -> SEEK_COALESCE_LOCAL_MS
+            }
             val timeSinceLastSeek = SystemClock.elapsedRealtime() - lastSeekAt
-            if (timeSinceLastSeek < coalesceMs) {
+            if (!flush && timeSinceLastSeek < coalesceMs) {
                 delay(coalesceMs - timeSinceLastSeek)
             }
             if (!isActive || !canAccessMpv()) return@launch
@@ -90,11 +123,26 @@ class PlaybackManager(
 
             if (!isActive || !canAccessMpv()) return@launch
 
+            if (flush) {
+                // No dedup: mpv can silently drop a seek while a file is still loading
+                // (no error, no PLAYBACK_RESTART), so the dispatched-position state cannot
+                // prove the last scrub landed and the release position must be re-sent.
+                lastScrubDispatchedPosition = Int.MIN_VALUE
+            } else if (isScrub) {
+                if (clampedPosition == lastScrubDispatchedPosition) return@launch
+            } else {
+                lastScrubDispatchedPosition = Int.MIN_VALUE
+            }
+
             // Use precise seeking only if preference is explicitly enabled or for short finite videos (1..119s)
             val shouldUsePreciseSeeking = playerPreferences.usePreciseSeeking.get() || (maxDuration in 1..119)
             val seekMode = if (shouldUsePreciseSeeking) "absolute+exact" else "absolute+keyframes"
             ensureUnmuted()
-            if (!canAccessMpv()) return@launch
+            if (!isActive || generation != seekGeneration || !canAccessMpv()) return@launch
+            // Record the dispatched position only past the final fence: written any earlier,
+            // a cancelled job can record a position it never dispatched and suppress the
+            // next scrub to that same position.
+            if (isScrub && !flush) lastScrubDispatchedPosition = clampedPosition
             runCatching { MPVLib.command("seek", clampedPosition.toString(), seekMode) }
         }
     }
@@ -104,9 +152,12 @@ class PlaybackManager(
      */
     fun seekBy(scope: CoroutineScope, offset: Int) {
         if (offset == 0 || !canAccessMpv()) return
-        
-        seekJob?.cancel()
+        lastScrubDispatchedPosition = Int.MIN_VALUE
+        seekGeneration++
+        val previousJob = seekJob
+        previousJob?.cancel()
         seekJob = scope.launch(Dispatchers.IO) {
+            previousJob?.join()
             if (!isActive || !canAccessMpv()) return@launch
             val duration = runCatching { MPVLib.getPropertyInt("duration") }.getOrNull() ?: 0
             val currentPos = runCatching { MPVLib.getPropertyInt("time-pos") }.getOrNull() ?: 0

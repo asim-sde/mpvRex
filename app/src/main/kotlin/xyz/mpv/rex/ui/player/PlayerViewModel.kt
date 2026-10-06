@@ -967,8 +967,12 @@ class PlayerViewModel(
     _playbackManager.seekBy(viewModelScope, offset)
   }
 
-  fun seekTo(position: Int) {
-    _playbackManager.seekTo(viewModelScope, position, abLoopA.value, abLoopB.value)
+  fun seekTo(position: Int, isScrub: Boolean = false, flush: Boolean = false) {
+    _playbackManager.seekTo(viewModelScope, position, abLoopA.value, abLoopB.value, isScrub, flush)
+  }
+
+  fun cancelPendingSeek() {
+    _playbackManager.cancelPendingSeek()
   }
 
   fun setPlaybackSpeed(speed: Float) {

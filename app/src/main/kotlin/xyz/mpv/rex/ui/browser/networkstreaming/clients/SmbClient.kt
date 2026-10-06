@@ -19,6 +19,7 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
+import java.io.FilterInputStream
 import java.io.InputStream
 import java.util.EnumSet
 import java.util.concurrent.TimeUnit
@@ -33,6 +34,7 @@ class SmbClient(connection: NetworkConnection) : BaseNetworkClient(connection) {
     private var shareName: String = ""
     private var resolvedHostIp: String = ""
     private val connectionMutex = Mutex()
+    private val connectShareLock = Any()
 
     companion object {
         private const val TAG = "SmbClient"
@@ -93,6 +95,10 @@ class SmbClient(connection: NetworkConnection) : BaseNetworkClient(connection) {
         val config = SmbConfig.builder()
             .withTimeout(30000, TimeUnit.MILLISECONDS)
             .withSoTimeout(35000, TimeUnit.MILLISECONDS)
+            // Paired with NetworkStreamingProxy's BLOCK_SIZE: a smaller read buffer silently
+            // splits each prefetch block into multiple clamped SMB2 reads (smbj caps read
+            // length at min(configured, negotiated MaxReadSize)).
+            .withReadBufferSize(4 * 1024 * 1024)
             .withDialects(
                 com.hierynomus.mssmb2.SMB2Dialect.SMB_3_1_1,
                 com.hierynomus.mssmb2.SMB2Dialect.SMB_3_0_2,
@@ -128,7 +134,7 @@ class SmbClient(connection: NetworkConnection) : BaseNetworkClient(connection) {
         session = smbConnection?.authenticate(authContext)
         
         // Test share access
-        (session?.connectShare(shareName) as? DiskShare)?.close()
+        connectShare().close()
     }
 
     override suspend fun performDisconnect() {
@@ -143,34 +149,31 @@ class SmbClient(connection: NetworkConnection) : BaseNetworkClient(connection) {
 
     override suspend fun performListFiles(path: String): List<NetworkFile> {
         return executeWithRetry {
-            val diskShare = session?.connectShare(shareName) as? DiskShare ?: throw java.net.SocketException("Session is null or share failed")
-            
-            diskShare.use { diskShare ->
-                val smbPath = path.trim('/').replace('/', '\\')
-                val fileList = diskShare.list(smbPath)
-                
-                fileList.filter { it.fileName != "." && it.fileName != ".." }
-                    .map { info ->
-                        val fileName = info.fileName
-                        val filePath = if (path.isEmpty() || path == "/") fileName 
-                        else "${path.trimEnd('/')}/$fileName"
+            val diskShare = connectShare()
+            val smbPath = path.trim('/').replace('/', '\\')
+            val fileList = diskShare.list(smbPath)
 
-                        NetworkFile(
-                            name = fileName,
-                            path = filePath,
-                            isDirectory = info.fileAttributes and 0x10L != 0L,
-                            size = info.endOfFile,
-                            lastModified = info.changeTime.toEpoch(TimeUnit.MILLISECONDS),
-                            mimeType = if (info.fileAttributes and 0x10L != 0L) null else getMimeType(fileName)
-                        )
-                    }
-            }
+            fileList.filter { it.fileName != "." && it.fileName != ".." }
+                .map { info ->
+                    val fileName = info.fileName
+                    val filePath = if (path.isEmpty() || path == "/") fileName 
+                    else "${path.trimEnd('/')}/$fileName"
+
+                    NetworkFile(
+                        name = fileName,
+                        path = filePath,
+                        isDirectory = info.fileAttributes and 0x10L != 0L,
+                        size = info.endOfFile,
+                        lastModified = info.changeTime.toEpoch(TimeUnit.MILLISECONDS),
+                        mimeType = if (info.fileAttributes and 0x10L != 0L) null else getMimeType(fileName)
+                    )
+                }
         }
     }
 
     override suspend fun performGetFileStream(path: String): InputStream {
         return executeWithRetry {
-            val diskShare = session?.connectShare(shareName) as? DiskShare ?: throw java.net.SocketException("Session is null or share failed")
+            val diskShare = connectShare()
             val smbPath = path.trim('/').replace('/', '\\')
             
             val file = diskShare.openFile(
@@ -182,7 +185,14 @@ class SmbClient(connection: NetworkConnection) : BaseNetworkClient(connection) {
                 null
             )
             
-            file.inputStream
+            // smbj 0.14.0's InputStream.close() only marks the stream closed; the SMB2 CLOSE
+            // releasing the server-side handle is sent by File.close().
+            object : FilterInputStream(file.inputStream) {
+                override fun close() {
+                    runCatching { super.close() }
+                    runCatching { file.close() }
+                }
+            }
         }
     }
 
@@ -197,14 +207,31 @@ class SmbClient(connection: NetworkConnection) : BaseNetworkClient(connection) {
     }
 
     /**
+     * Returns this client's [DiskShare], connecting it if necessary.
+     *
+     * smbj 0.14.0's Session.connectShare is an unsynchronized check-then-connect:
+     * two callers racing on one session can each create a tree connect and
+     * orphan one in the session's table until logoff, so every connectShare
+     * call must go through this lock. A per-client lock suffices because each
+     * stream client owns its own session.
+     */
+    fun connectShare(): DiskShare = synchronized(connectShareLock) {
+        session?.connectShare(shareName) as? DiskShare
+            ?: throw java.net.SocketException("Session is null or share failed")
+    }
+
+    /**
      * Runs [block] with this client's shared session, reconnecting
      * automatically (with the usual single-retry + session-reference guard)
      * if the session is dead.
      *
      * The session/connection are owned by this client and must NOT be closed
-     * by the caller. Callers should open their own tree connection
-     * (session.connectShare) and file handles inside [block], and close only
-     * those.
+     * by the caller. The share returned by [connectShare] is cached on the
+     * session and torn down when this client disconnects, so callers must
+     * never close it either: that would drop the tree connect under every
+     * concurrent request. Close only the file handles opened from the share;
+     * the sole sanctioned share close is performConnect's one-shot
+     * connectivity test, which runs before any concurrent request exists.
      */
     suspend fun <T> withSharedSession(block: suspend (session: Session, share: String) -> T): T =
         executeWithRetry {
@@ -214,13 +241,9 @@ class SmbClient(connection: NetworkConnection) : BaseNetworkClient(connection) {
 
     override suspend fun performGetFileSize(path: String): Long {
         return executeWithRetry {
-            val diskShare = session?.connectShare(shareName) as? DiskShare ?: throw java.net.SocketException("Session is null or share failed")
-            try {
-                val smbPath = path.trim('/').replace('/', '\\')
-                diskShare.getFileInformation(smbPath).standardInformation.endOfFile
-            } finally {
-                diskShare.close()
-            }
+            val diskShare = connectShare()
+            val smbPath = path.trim('/').replace('/', '\\')
+            diskShare.getFileInformation(smbPath).standardInformation.endOfFile
         }
     }
 

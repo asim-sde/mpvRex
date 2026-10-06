@@ -290,9 +290,7 @@ class PlayerPlaylistLoader(
     }
     // Load the new video
     // Avoid blocking UI thread while mpv opens network streams (e.g., HLS).
-    activity.lifecycleScope.launch(Dispatchers.Default) {
-      MPVLib.command("loadfile", playableUri)
-    }
+    activity.dispatchLoadFile(playableUri)
 
     // Update media title (this will trigger UI update)
     // Don't force media-title for standalone m3u/m3u8 streams - let MPV provide it
@@ -481,11 +479,9 @@ class PlayerPlaylistLoader(
             runCatching { MPVLib.setPropertyBoolean("pause", true) }
           }
           if (activity.mpvInitialized) {
-            activity.lifecycleScope.launch(Dispatchers.Default) {
-              MPVLib.command("loadfile", uriStr)
-            }
+            activity.dispatchLoadFile(uriStr) { null }
           } else {
-            activity.player.playFile(uriStr)
+            activity.player.pendingColdStartLoad = { activity.dispatchLoadFile(uriStr) { null } }
           }
         }
       }

@@ -230,6 +230,7 @@ fun PlayerControls(
   var dragStartValue by remember { mutableStateOf(-1f) }
   var isCloseToStart by remember { mutableStateOf(false) }
   var changeCount by remember { mutableStateOf(0) }
+  var lastScrubPosition by remember { mutableStateOf(-1f) }
   var resetControlsTimestamp by remember { mutableStateOf(0L) }
   var wasPlayingBeforeSeek by remember { mutableStateOf(false) }
   val isPlaybackPaused = if (isSeeking && wasPlayingBeforeSeek) false else (paused ?: false)
@@ -242,6 +243,7 @@ fun PlayerControls(
     dragStartValue = -1f
     isCloseToStart = false
     changeCount = 0
+    lastScrubPosition = -1f
     wasPlayingBeforeSeek = false
   }
   val seekText by viewModel.seekText.collectAsState()
@@ -1479,13 +1481,16 @@ fun PlayerControls(
                     viewModel.playerUpdate.value = PlayerUpdates.None
                   }
                 }
-                viewModel.seekTo(newValue.toInt())
+                lastScrubPosition = newValue
+                viewModel.seekTo(newValue.toInt(), isScrub = true)
                 viewModel.autoHideControls()
               },
               onValueChangeFinished = {
                 if (isCloseToStart) {
-                  viewModel.seekTo(dragStartValue.toInt())
+                  viewModel.seekTo(dragStartValue.toInt(), flush = true)
                   viewModel.playerUpdate.value = PlayerUpdates.None
+                } else if (lastScrubPosition >= 0f) {
+                  viewModel.seekTo(lastScrubPosition.toInt(), flush = true)
                 }
                 if (wasPlayingBeforeSeek) {
                   runCatching { MPVLib.setPropertyBoolean("pause", false) }
@@ -1494,6 +1499,7 @@ fun PlayerControls(
                 dragStartValue = -1f
                 isCloseToStart = false
                 changeCount = 0
+                lastScrubPosition = -1f
                 wasPlayingBeforeSeek = false
                 resetControlsTimestamp = System.currentTimeMillis()
                 viewModel.showControls()

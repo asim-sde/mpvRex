@@ -22,6 +22,14 @@ object MPVLifecycleLock {
     private set
 
   /**
+   * Monitor that must be held from a native-call lifecycle check through the call itself,
+   * and across `MPVLib.destroy()` during teardown. A check made without holding it is
+   * check-then-act: libmpv treats calls overlapping `mpv_terminate_destroy` as undefined,
+   * and the JNI layer exits the process on a call arriving after the context is freed.
+   */
+  val nativeApiLock = Any()
+
+  /**
    * Called when native MPV initialization is complete in MPVView.postInitOptions().
    */
   fun onNativeInitialized() {

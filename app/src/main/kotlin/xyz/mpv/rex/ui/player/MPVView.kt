@@ -37,6 +37,14 @@ class MPVView(
   var isExiting = false
 
   /**
+   * First file load parked by [PlayerActivity] for cold starts and fired from [surfaceCreated].
+   * The deferral exists because [BaseMPVView.playFile] can only issue a bare `loadfile` without
+   * per-file options (e.g. proxy demuxer cache caps), so the full command waits for the surface.
+   * Fires at most once: [surfaceCreated] clears it before invoking.
+   */
+  var pendingColdStartLoad: (() -> Unit)? = null
+
+  /**
    * When the activity handles rotation itself (see `configChanges` in the manifest) the
    * SurfaceView is resized in place, so only [surfaceChanged] fires — not [surfaceCreated].
    * The base class merely pushes the new `android-surface-size` to mpv. While playback is
@@ -194,6 +202,11 @@ class MPVView(
   override fun surfaceCreated(holder: SurfaceHolder) {
     super.surfaceCreated(holder)
     if (!MPVLifecycleLock.isNativeInitialized || MPVLifecycleLock.isTearingDown.value || isExiting) return
+
+    pendingColdStartLoad?.let { load ->
+      pendingColdStartLoad = null
+      load()
+    }
 
     // Audio may have been loaded while vo=null with no video track selected. Unlike vid=auto,
     // selecting the attached-picture track by ID reliably starts its single-frame decoder.

@@ -1048,6 +1048,7 @@ fun GestureHandler(
           var wasPlayingBeforeGestureSeek = false
           var hasTriggeredSubSeek = false
           var initialVideoPosition = 0f
+          var lastSeekTarget = -1f
           // Use the sensitivity preference instead of hardcoded value
           val seekSensitivity = horizontalSwipeSensitivity
           
@@ -1111,7 +1112,8 @@ fun GestureHandler(
                     
                     // Use the same seeking mechanism as seekbar scrubbing
                     // This will update the seekbar position and provide live preview
-                    viewModel.seekTo(clampedPosition.toInt())
+                    viewModel.seekTo(clampedPosition.toInt(), isScrub = true)
+                    lastSeekTarget = clampedPosition
                     
                     // Format and display time position updates
                     val currentPos = clampedPosition.toInt()
@@ -1158,6 +1160,14 @@ fun GestureHandler(
                   wasPlayingBeforeGestureSeek = false
                 }
                 hasStartedSeeking = false
+                val cancelledTarget = lastSeekTarget
+                lastSeekTarget = -1f
+                viewModel.cancelPendingSeek()
+                // The in-flight scrub can lag the preview by up to one coalesce window;
+                // re-send the cancelled target so playback lands where the UI showed.
+                if (cancelledTarget >= 0f) {
+                  viewModel.seekTo(cancelledTarget.toInt(), flush = true)
+                }
                 viewModel.setGestureSeeking(false)
                 // Clean up seeking state without showing controls
                 viewModel.playerUpdate.update { PlayerUpdates.None }
@@ -1169,6 +1179,9 @@ fun GestureHandler(
 
           // Apply the final seek when gesture ends
           if (hasStartedSeeking) {
+            if (lastSeekTarget >= 0f) {
+              viewModel.seekTo(lastSeekTarget.toInt(), flush = true)
+            }
             if (wasPlayingBeforeGestureSeek) {
               runCatching { MPVLib.setPropertyBoolean("pause", false) }
               wasPlayingBeforeGestureSeek = false
