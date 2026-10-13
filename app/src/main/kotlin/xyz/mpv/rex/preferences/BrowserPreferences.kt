@@ -80,6 +80,7 @@ class BrowserPreferences(
   // Network sorting preferences
   val networkSortType = preferenceStore.getEnum("network_sort_type", FolderSortType.Title)
   val networkSortOrder = preferenceStore.getEnum("network_sort_order", SortOrder.Ascending)
+  val networkShowHiddenFiles = preferenceStore.getBoolean("network_show_hidden_files", false)
   val networkSortOrderTitle = preferenceStore.getEnum("network_sort_order_title", SortOrder.Ascending)
   val networkSortOrderDate = preferenceStore.getEnum("network_sort_order_date", SortOrder.Descending)
   val networkSortOrderSize = preferenceStore.getEnum("network_sort_order_size", SortOrder.Descending)
